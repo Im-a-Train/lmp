@@ -13,7 +13,7 @@ use sysinfo::Networks;
 use tauri::{AppHandle, Builder, Emitter, Manager};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tauri::async_runtime::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
