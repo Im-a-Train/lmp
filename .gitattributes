@@ -1,0 +1,12 @@
+# Normalize line endings for text files
+* text=auto
+
+# Explicitly mark binary files to prevent CRLF corruption
+*.png binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.wasm binary
