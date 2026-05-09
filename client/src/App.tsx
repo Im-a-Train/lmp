@@ -1,11 +1,13 @@
 import type { CSSProperties } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 type AppConfig = {
   client_id: string;
   server_url: string;
   metrics_interval_seconds: number;
+  username?: string | null;
 };
 
 type RegisterResponse = {
@@ -14,13 +16,6 @@ type RegisterResponse = {
   metrics_interval_seconds: number;
   udp_echo_host: string;
   udp_echo_port: number;
-};
-
-type NetworkSnapshot = {
-  interface_name?: string | null;
-  transmitted_bytes: number;
-  received_bytes: number;
-  captured_at_unix_ms: number;
 };
 
 type ClientStatus = {
@@ -33,92 +28,107 @@ type ClientStatus = {
   server_reachable: boolean;
   local_ip?: string | null;
   interface_name?: string | null;
-  next_snapshot: NetworkSnapshot;
+};
+
+type DiscoveredServer = {
+  name: string;
+  url: string;
 };
 
 function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [draftServerUrl, setDraftServerUrl] = useState('http://localhost:8080');
+  const [draftUsername, setDraftUsername] = useState('');
   const [registration, setRegistration] = useState<RegisterResponse | null>(null);
+  const [monitoring, setMonitoring] = useState(false);
   const [status, setStatus] = useState<ClientStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const previousSnapshotRef = useRef<NetworkSnapshot | null>(null);
+  const [discovered, setDiscovered] = useState<DiscoveredServer[]>([]);
+  const [discovering, setDiscovering] = useState(false);
+  const unlistenRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     invoke<AppConfig>('load_config')
       .then((loaded) => {
         setConfig(loaded);
         setDraftServerUrl(loaded.server_url || 'http://localhost:8080');
+        setDraftUsername(loaded.username || '');
       })
       .catch((err) => setError(String(err)));
   }, []);
 
+  // Listen to metric updates emitted by the Rust monitoring loop
   useEffect(() => {
-    if (!config || !registration) {
-      return;
-    }
-
-    let cancelled = false;
-    let timer = 0;
-
-    const run = async () => {
-      try {
-        const nextStatus = await invoke<ClientStatus>('report_metrics', {
-          config,
-          udpHost: registration.udp_echo_host,
-          udpPort: registration.udp_echo_port,
-          previousSnapshot: previousSnapshotRef.current,
-        });
-        if (!cancelled) {
-          previousSnapshotRef.current = nextStatus.next_snapshot;
-          setStatus(nextStatus);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(String(err));
-        }
-      } finally {
-        if (!cancelled) {
-          timer = window.setTimeout(run, config.metrics_interval_seconds * 1000);
-        }
+    let active = true;
+    listen<ClientStatus>('metric_update', (event) => {
+      if (active) {
+        setStatus(event.payload);
+        setError(null);
       }
-    };
-
-    void run();
-
+    }).then((unlisten) => {
+      unlistenRef.current = unlisten;
+    });
     return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
+      active = false;
+      unlistenRef.current?.();
     };
-  }, [config, registration]);
+  }, []);
 
   async function handleConnect() {
-    if (!config) {
-      return;
-    }
-
+    if (!config) return;
     setBusy(true);
     try {
-      const nextConfig = {
+      const nextConfig: AppConfig = {
         ...config,
         server_url: draftServerUrl.trim(),
+        username: draftUsername.trim() || null,
       };
       const saved = await invoke<AppConfig>('save_config', { config: nextConfig });
       const registered = await invoke<RegisterResponse>('register_client', { config: saved });
-      const syncedConfig = {
+      const syncedConfig: AppConfig = {
         ...saved,
         metrics_interval_seconds: registered.metrics_interval_seconds,
       };
       await invoke<AppConfig>('save_config', { config: syncedConfig });
       setConfig(syncedConfig);
       setRegistration(registered);
+      await invoke('start_monitoring', {
+        config: syncedConfig,
+        udpHost: registered.udp_echo_host,
+        udpPort: registered.udp_echo_port,
+      });
+      setMonitoring(true);
       setError(null);
     } catch (err) {
       setError(String(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleDisconnect() {
+    try {
+      await invoke('stop_monitoring');
+    } catch {
+      // best-effort
+    }
+    setMonitoring(false);
+    setRegistration(null);
+    setStatus(null);
+  }
+
+  async function handleDiscover() {
+    setDiscovering(true);
+    setDiscovered([]);
+    try {
+      const found = await invoke<DiscoveredServer[]>('discover_servers');
+      setDiscovered(found);
+      if (found.length === 0) setError('No servers found on the network.');
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setDiscovering(false);
     }
   }
 
@@ -128,30 +138,87 @@ function App() {
         <p style={eyebrowStyle}>LAN Pulse Client</p>
         <h1 style={{ marginTop: 0 }}>Desktop Monitor Agent</h1>
         <p style={{ color: '#546579', lineHeight: 1.6 }}>
-          Register this machine with the LAN Pulse server and keep the window open during the event to continue reporting
-          latency, jitter, packet loss, and throughput.
+          Register this machine with the LAN Pulse server and keep the window open during the event to
+          continue reporting latency, jitter, packet loss, and throughput.
         </p>
 
         <label style={labelStyle}>
-          Server URL
+          Username (optional)
           <input
-            value={draftServerUrl}
-            onChange={(event) => setDraftServerUrl(event.target.value)}
-            placeholder="http://192.168.1.10:8080"
+            value={draftUsername}
+            onChange={(e) => setDraftUsername(e.target.value)}
+            placeholder="Leave blank to use system username"
             style={inputStyle}
+            disabled={monitoring}
           />
         </label>
 
-        <button onClick={handleConnect} disabled={busy} style={buttonStyle}>
-          {busy ? 'Connecting…' : 'Save and Connect'}
-        </button>
+        <label style={labelStyle}>
+          Server URL
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              value={draftServerUrl}
+              onChange={(e) => setDraftServerUrl(e.target.value)}
+              placeholder="http://192.168.1.10:8080"
+              style={{ ...inputStyle, flex: 1 }}
+              disabled={monitoring}
+            />
+            <button
+              onClick={handleDiscover}
+              disabled={discovering || monitoring}
+              style={secondaryButtonStyle}
+              title="Discover servers on this network"
+            >
+              {discovering ? 'Scanning…' : 'Discover'}
+            </button>
+          </div>
+        </label>
+
+        {discovered.length > 0 && (
+          <div style={discoveryListStyle}>
+            {discovered.map((s) => (
+              <button
+                key={s.url}
+                style={discoveryItemStyle}
+                onClick={() => {
+                  setDraftServerUrl(s.url);
+                  setDiscovered([]);
+                }}
+              >
+                <span style={{ fontWeight: 600 }}>{s.name}</span>
+                <span style={{ color: '#546579', fontSize: 13 }}>{s.url}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+          <button onClick={handleConnect} disabled={busy || monitoring} style={buttonStyle}>
+            {busy ? 'Connecting…' : 'Save and Connect'}
+          </button>
+          {monitoring && (
+            <button onClick={handleDisconnect} style={disconnectButtonStyle}>
+              Disconnect
+            </button>
+          )}
+        </div>
 
         {config ? (
           <div style={gridStyle}>
-            <StatusTile label="Client ID" value={config.client_id} />
-            <StatusTile label="Connection" value={registration ? 'Connected' : 'Waiting'} />
-            <StatusTile label="Last Latency" value={status?.latency_ms ? `${status.latency_ms.toFixed(1)} ms` : 'N/A'} />
-            <StatusTile label="Packet Loss" value={status ? `${status.packet_loss_percent.toFixed(1)} %` : 'N/A'} />
+            <StatusTile label="Client ID" value={config.client_id.slice(0, 8) + '…'} />
+            <StatusTile
+              label="Connection"
+              value={monitoring ? 'Connected' : 'Disconnected'}
+              accent={monitoring ? '#22c55e' : '#94a3b8'}
+            />
+            <StatusTile
+              label="Last Latency"
+              value={status?.latency_ms != null ? `${status.latency_ms.toFixed(1)} ms` : 'N/A'}
+            />
+            <StatusTile
+              label="Packet Loss"
+              value={status ? `${status.packet_loss_percent.toFixed(1)} %` : 'N/A'}
+            />
             <StatusTile label="Upload" value={status ? `${status.tx_mbps.toFixed(2)} Mbps` : 'N/A'} />
             <StatusTile label="Download" value={status ? `${status.rx_mbps.toFixed(2)} Mbps` : 'N/A'} />
           </div>
@@ -162,7 +229,8 @@ function App() {
             <strong>Server:</strong> {config?.server_url || draftServerUrl}
           </p>
           <p>
-            <strong>Last Report:</strong> {status ? new Date(status.timestamp).toLocaleTimeString() : 'No data yet'}
+            <strong>Last Report:</strong>{' '}
+            {status ? new Date(status.timestamp).toLocaleTimeString() : 'No data yet'}
           </p>
           <p>
             <strong>Interface:</strong> {status?.interface_name ?? 'Unknown'}
@@ -178,11 +246,11 @@ function App() {
   );
 }
 
-function StatusTile({ label, value }: { label: string; value: string }) {
+function StatusTile({ label, value, accent }: { label: string; value: string; accent?: string }) {
   return (
     <div style={tileStyle}>
       <span style={{ color: '#5e7188', fontSize: 14 }}>{label}</span>
-      <strong style={{ fontSize: 16 }}>{value}</strong>
+      <strong style={{ fontSize: 16, color: accent }}>{value}</strong>
     </div>
   );
 }
@@ -229,7 +297,7 @@ const inputStyle: CSSProperties = {
 };
 
 const buttonStyle: CSSProperties = {
-  marginTop: 16,
+  marginTop: 0,
   padding: '12px 18px',
   borderRadius: 14,
   border: 'none',
@@ -238,6 +306,51 @@ const buttonStyle: CSSProperties = {
   fontSize: 16,
   fontWeight: 700,
   cursor: 'pointer',
+};
+
+const secondaryButtonStyle: CSSProperties = {
+  padding: '12px 16px',
+  borderRadius: 14,
+  border: '1px solid #c7d4e7',
+  background: 'white',
+  color: '#122033',
+  fontSize: 15,
+  fontWeight: 600,
+  cursor: 'pointer',
+  whiteSpace: 'nowrap',
+};
+
+const disconnectButtonStyle: CSSProperties = {
+  marginTop: 0,
+  padding: '12px 18px',
+  borderRadius: 14,
+  border: '1px solid #e9b8b8',
+  background: '#fff5f5',
+  color: '#c23838',
+  fontSize: 16,
+  fontWeight: 700,
+  cursor: 'pointer',
+};
+
+const discoveryListStyle: CSSProperties = {
+  marginTop: 8,
+  border: '1px solid #c7d4e7',
+  borderRadius: 14,
+  overflow: 'hidden',
+};
+
+const discoveryItemStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 2,
+  width: '100%',
+  padding: '10px 14px',
+  border: 'none',
+  borderBottom: '1px solid #e8eef7',
+  background: 'white',
+  textAlign: 'left',
+  cursor: 'pointer',
+  fontSize: 14,
 };
 
 const gridStyle: CSSProperties = {

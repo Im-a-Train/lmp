@@ -86,3 +86,43 @@ jobs:
         with:
           name: lanpulse-client-windows
           path: client/src-tauri/target/release/bundle/nsis/*.exe
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [server, web, client, client-windows]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux client bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: lanpulse-client-linux
+          path: downloads/
+
+      - name: Download Windows client bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: lanpulse-client-windows
+          path: downloads/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          tags: |
+            mjohner/lpm:latest
+            mjohner/lpm:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

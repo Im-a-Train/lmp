@@ -17,14 +17,15 @@ from app.api.config import router as config_router
 from app.api.dashboard import router as dashboard_router
 from app.api.downloads import router as downloads_router
 from app.api.events import router as events_router
-from app.api.metrics import router as metrics_router
+from app.api.metrics import process_metric, router as metrics_router
 from app.core.config import Settings, settings
 from app.core.database import database
+from app.core.mdns import start_mdns, stop_mdns
 from app.core.udp_echo import start_udp_echo_server
 from app.core.websocket import manager
 from app.models.client import ClientRecord
 from app.models.event import EventRecord
-from app.models.metric import ClientMetricRecord
+from app.models.metric import ClientMetricIn, ClientMetricRecord
 
 
 async def offline_monitor(stop_event: asyncio.Event, app_settings: Settings) -> None:
@@ -76,6 +77,13 @@ async def retention_cleanup(stop_event: asyncio.Event, app_settings: Settings) -
             continue
 
 
+def _public_port(base_url: str) -> int:
+    try:
+        return int(base_url.rstrip("/").rsplit(":", 1)[-1])
+    except (ValueError, IndexError):
+        return 8080
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app_settings: Settings = app.state.settings
@@ -89,6 +97,12 @@ async def lifespan(app: FastAPI):
     app.state.stop_event = stop_event
     app.state.udp_transport = udp_transport
     app.state.background_tasks = [offline_task, cleanup_task]
+
+    mdns_zc, mdns_info = await start_mdns(
+        app_settings.app_name,
+        _public_port(app_settings.public_base_url),
+    )
+
     try:
         yield
     finally:
@@ -97,6 +111,7 @@ async def lifespan(app: FastAPI):
         for task in app.state.background_tasks:
             task.cancel()
         await asyncio.gather(*app.state.background_tasks, return_exceptions=True)
+        await stop_mdns(mdns_zc, mdns_info)
         await database.dispose()
 
 
@@ -126,6 +141,26 @@ def create_app(app_settings: Settings = settings) -> FastAPI:
                 await websocket.receive_text()
         except WebSocketDisconnect:
             manager.disconnect(websocket)
+
+    @app.websocket("/ws/client")
+    async def client_websocket(websocket: WebSocket) -> None:
+        await websocket.accept()
+        try:
+            while True:
+                data = await websocket.receive_text()
+                try:
+                    payload = ClientMetricIn.model_validate_json(data)
+                except Exception:
+                    continue
+                try:
+                    async for session in database.session():
+                        await process_metric(payload, session)
+                except ValueError:
+                    pass
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
 
     web_dist = app_settings.web_dist_dir
     assets_dir = web_dist / "assets"

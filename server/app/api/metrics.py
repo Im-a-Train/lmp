@@ -15,14 +15,11 @@ from app.models.metric import ClientMetricIn, ClientMetricRecord
 router = APIRouter(prefix="/api/metrics", tags=["metrics"])
 
 
-@router.post("/")
-async def create_metric(
-    payload: ClientMetricIn,
-    session: AsyncSession = Depends(get_session),
-) -> dict[str, bool]:
+async def process_metric(payload: ClientMetricIn, session: AsyncSession) -> None:
+    """Store a metric record and broadcast it to dashboard WebSocket subscribers."""
     client = await session.get(ClientRecord, payload.client_id)
     if client is None:
-        raise HTTPException(status_code=404, detail="Client must be registered before uploading metrics")
+        raise ValueError("Client must be registered before uploading metrics")
 
     metric = ClientMetricRecord(
         client_id=payload.client_id,
@@ -81,4 +78,15 @@ async def create_metric(
             },
         }
     )
+
+
+@router.post("/")
+async def create_metric(
+    payload: ClientMetricIn,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, bool]:
+    try:
+        await process_metric(payload, session)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     return {"ok": True}

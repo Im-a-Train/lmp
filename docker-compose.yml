@@ -14,7 +14,8 @@ services:
       DOWNLOADS_DIR: /app/downloads
       WEB_DIST_DIR: /app/web-dist
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     volumes:
       - ./downloads:/app/downloads
   db:
@@ -25,5 +26,10 @@ services:
       POSTGRES_DB: lanmonitor
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lanmonitor -d lanmonitor"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 volumes:
   postgres_data:
